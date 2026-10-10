@@ -26,6 +26,13 @@
 #define YELLOW_LED_PIN          1
 
 
+// UART mirror output (same data as the USB Type-C port)
+//
+// GPIO20 is used as TX only, so RX is left unassigned.
+#define MIRROR_TX_PIN           20
+#define MIRROR_BAUD             SERIAL_BAUD
+
+
 // ============================================================
 // Sampling configuration
 // ============================================================
@@ -1647,62 +1654,37 @@ void runMeasurement()
 
     // ========================================================
     // Compact UART output
+    //
+    // The whole line is built once, then written to both the
+    // USB Type-C port and the GPIO20 UART, so both carry the
+    // exact same bytes at the exact same rate.
     // ========================================================
 
-    Serial.print(
-        "VIB="
-    );
+    char outputLine[96];
 
 
-    Serial.print(
+    snprintf(
+        outputLine,
+        sizeof(outputLine),
+        "VIB=%d,FREQ=%.2fHz,STARTSTOP=%.3fHz,RATIO=%.2f",
         vibrationState
         ?
         1
         :
-        0
-    );
-
-
-    Serial.print(
-        ",FREQ="
-    );
-
-
-    Serial.print(
+        0,
         mainFrequency,
-        2
-    );
-
-
-    Serial.print(
-        "Hz"
-    );
-
-
-    Serial.print(
-        ",STARTSTOP="
-    );
-
-
-    Serial.print(
         startStopFrequency,
-        3
-    );
-
-
-    Serial.print(
-        "Hz"
-    );
-
-
-    Serial.print(
-        ",RATIO="
+        best.peakRatio
     );
 
 
     Serial.println(
-        best.peakRatio,
-        2
+        outputLine
+    );
+
+
+    Serial1.println(
+        outputLine
     );
 }
 
@@ -1746,6 +1728,20 @@ void setup()
     digitalWrite(
         YELLOW_LED_PIN,
         LOW
+    );
+
+
+    // --------------------------------------------------------
+    // Mirrored UART on GPIO20
+    //
+    // RX is not needed, so it is disabled with -1.
+    // --------------------------------------------------------
+
+    Serial1.begin(
+        MIRROR_BAUD,
+        SERIAL_8N1,
+        -1,
+        MIRROR_TX_PIN
     );
 
 
