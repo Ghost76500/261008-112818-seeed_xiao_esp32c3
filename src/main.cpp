@@ -8,13 +8,19 @@
 // Current UART output:
 //     VIB=1,FREQ=235.31Hz,STARTSTOP=0.000Hz,RATIO=69.19（RATIO是FFT谱峰相对背景的强度，>10数据可信度高）
 //
+// VIB     : 本次采集(约1秒)内出现过振动
+// FREQ    : 本次采集测到的载波频率，80~180 Hz 之外显示 0
+// STARTSTOP: 启停频率，取最近约8秒内上升沿的平均间隔，超过8 Hz按8 Hz输出，
+//            超过5秒不再出现上升沿时归0
+// RATIO   : 谱峰/背景
+//
 // Hardware:
 //     ESP32-C3
 //     MPU6050
 // ============================================================
 
-#define SDA_PIN                 9
-#define SCL_PIN                 8
+#define SDA_PIN                 10
+#define SCL_PIN                 9
 
 #define MPU_ADDR                0x68
 
@@ -22,8 +28,8 @@
 
 
 // LED pins
-#define GREEN_LED_PIN           0
-#define YELLOW_LED_PIN          1
+#define GREEN_LED_PIN           6
+#define YELLOW_LED_PIN          5
 
 
 // UART mirror output (same data as the USB Type-C port)
@@ -54,12 +60,36 @@
 // Short-time envelope
 //
 // 32 samples @ 1000 Hz = 32 ms
+//
+// The 32 ms RMS window is kept, because the 120 / 180 levels
+// were calibrated against it. The window now advances by
+// ENV_BLOCK_HOP samples instead of a full window, so the
+// envelope is evaluated every 8 ms: short start/stop pauses
+// become visible and the rising-edge timestamp resolution drops
+// from 32 ms to 8 ms.
 // ============================================================
 
 #define ENV_BLOCK_SIZE          32
+#define ENV_BLOCK_HOP           8
 
 #define ENV_BLOCK_COUNT         \
-    (SAMPLE_COUNT / ENV_BLOCK_SIZE)
+    (((SAMPLE_COUNT - ENV_BLOCK_SIZE) / ENV_BLOCK_HOP) + 1)
+
+// Monitor burst used while the FFTs run. The three 1024 point
+// FFTs take roughly 300 ms, and nothing was sampled during that
+// time; a start/stop pause falling into that hole was lost. On
+// the real machine this showed up as 3 rising edges per capture
+// instead of 4 (1.335 s capture period, 3 start/stop) and a
+// start/stop reading about 25% low.
+//
+// Each FFT is also split in the middle (see FFT_BURST_STAGE_LEN),
+// which halves the largest unsampled hole from ~93 ms to ~46 ms.
+#define MON_BURST_SAMPLES       50
+
+#define FFT_BURST_STAGE_LEN     32
+
+#define MON_BURST_WINDOWS       \
+    (((MON_BURST_SAMPLES - ENV_BLOCK_SIZE) / ENV_BLOCK_HOP) + 1)
 
 
 // ============================================================
@@ -67,20 +97,60 @@
 //
 // Based on current measurements:
 //
-// Quiet:
-//     envelope approximately 50~100
+// Bench machine (173 Hz carrier, 3 Hz start/stop):
+//     quiet / pause level   approximately 500
+//     running burst level   approximately 12000
 //
-// Strong vibration:
-//     envelope can reach approximately 270~330
+// Older setup:
+//     quiet 50~100, strong vibration 270~330
 //
 // Hysteresis:
 //
-//     OFF threshold = 120
-//     ON  threshold = 180
+// Both thresholds follow the running envelope peak, so the gap
+// between them can never invert:
+//
+//     ON  threshold = max(180, 55% of the running peak)
+//     OFF threshold = max(120, 28% of the running peak)
+//
+// With a peak of 12300 (the machine on the test bench) that is
+// ON 6770 / OFF 3440, and with a quiet level of ~500 the pause is
+// always unambiguous. The arm level used to be 75% of the peak,
+// which the spin-up of some start/stop cycles did not sustain for
+// long enough, so those pauses were dropped.
+//
+// With a peak of ~350 that is ON 193 / OFF 120. An earlier
+// version kept the ON level fixed at 180 while raising the OFF
+// level to 55% of the peak (~190 on the real machine), which put
+// OFF *above* ON: the envelope then chattered across that band
+// and produced dozens of fake rising edges per second.
+//
+// A fixed OFF threshold of 120 is what used to latch the
+// detector ON: during a short start/stop pause the machine had
+// not coasted down to 120 yet, so the state never reset, no
+// further rising edge was ever seen and the reported start/stop
+// rate was forced to 0 by the stale timeout. The relative
+// threshold follows the actual level of the machine instead.
 // ============================================================
 
 #define VIB_ON_THRESHOLD        180.0f
-#define VIB_OFF_THRESHOLD       120.0f
+#define VIB_ON_RATIO            0.55f
+
+#define VIB_OFF_FLOOR           120.0f
+#define VIB_OFF_RATIO           0.28f
+
+// Decay of the running envelope peak, applied once per envelope
+// block. 0.995 per 8 ms is roughly a 1.6 s time constant.
+#define ENV_PEAK_DECAY          0.995f
+
+// A capture counts as vibrating when at least this many envelope
+// blocks exceed VIB_ON_THRESHOLD.
+// 6 blocks * 8 ms hop = 48 ms of real vibration.
+#define VIB_MIN_ON_BLOCKS       6
+
+// A level crossing only counts after this many consecutive
+// blocks, so threshold chatter cannot create fake edges.
+// 3 blocks * 8 ms = 24 ms.
+#define VIB_CONFIRM_BLOCKS      3
 
 
 // ============================================================
@@ -95,9 +165,29 @@
 
 #define MIN_PEAK_RATIO          5.0f
 
-//启停范围
-#define STARTSTOP_MAX_HZ        3.0f
-#define STARTSTOP_TIMEOUT_MS    3000
+// ============================================================
+// Start/stop rate estimation
+//
+// The rate is averaged over the rising edges of the last
+// STARTSTOP_AVG_WINDOW_MS, so one missed edge only biases the
+// value instead of doubling or halving it. Slow cycling falls
+// back to the plain period between the last two edges.
+//
+// The bench machine (3 Hz) alternates short (~230 ms) and long
+// (~460 ms) cycles, so a two or three cycle average wobbles
+// between 2.2 and 2.9 Hz. Averaging over the whole window
+// (about 7 s, 19 intervals at 3 Hz) settles it at 2.9 Hz, which
+// matches the setpoint.
+// ============================================================
+
+// Reporting clamp only; it no longer discards measurements.
+#define STARTSTOP_MAX_HZ        8.0f
+
+#define STARTSTOP_EDGE_HISTORY  20
+#define STARTSTOP_AVG_WINDOW_MS 8000
+#define STARTSTOP_MIN_EDGES     4
+#define STARTSTOP_SLOW_SPAN_MS  20000
+#define STARTSTOP_HOLD_MS       5000
 
 
 // ============================================================
@@ -111,6 +201,7 @@
 #define REG_ACCEL_XOUT_H        0x3B
 
 #define REG_PWR_MGMT_1          0x6B
+#define REG_PWR_MGMT_2          0x6C
 #define REG_WHO_AM_I            0x75
 
 // ============================================================
@@ -119,6 +210,11 @@
 int16_t axBuffer[SAMPLE_COUNT];
 int16_t ayBuffer[SAMPLE_COUNT];
 int16_t azBuffer[SAMPLE_COUNT];
+
+// Monitor burst buffer, sampled between the FFTs
+int16_t monBufferX[MON_BURST_SAMPLES];
+int16_t monBufferY[MON_BURST_SAMPLES];
+int16_t monBufferZ[MON_BURST_SAMPLES];
 
 // ============================================================
 // FFT buffers
@@ -149,14 +245,34 @@ struct FFTResult
 // ============================================================
 // System states
 // ============================================================
+// Instantaneous hysteresis state, drives rising-edge detection
 bool vibrationState = false;
+// Vibration anywhere inside the current capture
+bool vibrationPresent = false;
+// Running envelope peak with slow decay; reference level for the
+// relative OFF threshold
+float envelopePeak = 0.0f;
+// Envelope sample source: the capture buffer or a monitor burst
+int16_t *envBufX = axBuffer;
+int16_t *envBufY = ayBuffer;
+int16_t *envBufZ = azBuffer;
+int envWindowCount = 0;
+// Confirmation runs persist across captures and bursts, so a run
+// may continue over a sampling gap.
+int armRunBlocks = 0;
+int offRunBlocks = 0;
+uint32_t armRunStartMs = 0;
+// Accumulators over one whole measurement (capture + bursts)
+int measurementBlocks = 0;
 // Current detected carrier frequency
 float mainFrequency = 0.0f;
 // Current start/stop frequency
 float startStopFrequency = 0.0f;
-// Rising-edge timing
+// Rising-edge history, ring buffer of absolute times in ms
 uint32_t lastRisingEdgeMs = 0;
-uint32_t previousRisingEdgeMs = 0;
+uint32_t edgeTimeMs[STARTSTOP_EDGE_HISTORY];
+int edgeWriteIndex = 0;
+int edgeStoredCount = 0;
 
 // ============================================================
 // MPU6050 register write
@@ -310,14 +426,13 @@ bool initMPU6050()
     }
 
     // --------------------------------------------------------
-    // Wake MPU6050
-    // CLKSEL = X-axis gyro PLL
+    // Wake MPU6050 using its internal oscillator.
     // --------------------------------------------------------
 
     if (
         !writeRegister(
             REG_PWR_MGMT_1,
-            0x01
+            0x00
         )
     )
     {
@@ -326,6 +441,18 @@ bool initMPU6050()
 
 
     delay(100);
+
+    // The accelerometer is used, but all three gyroscope axes are not.
+    // STBY_XG/YG/ZG = 1; accelerometer standby bits remain clear.
+    if (
+        !writeRegister(
+            REG_PWR_MGMT_2,
+            0x07
+        )
+    )
+    {
+        return false;
+    }
 
 
     // --------------------------------------------------------
@@ -595,6 +722,12 @@ float calculateRMS(
 // Radix-2 FFT
 // ============================================================
 
+// The FFT calls this in the middle of its stage loop, so the
+// envelope detector keeps sampling while the spectrum is being
+// computed.
+void captureMonitorBurst();
+
+
 void performFFT(
     float *real,
     float *imag,
@@ -791,6 +924,16 @@ void performFFT(
                 wImag =
                     newWImag;
             }
+        }
+
+
+        // ----------------------------------------------------
+        // Keep the envelope detector alive while the FFT runs.
+        // ----------------------------------------------------
+
+        if (len == FFT_BURST_STAGE_LEN)
+        {
+            captureMonitorBurst();
         }
     }
 }
@@ -1132,20 +1275,62 @@ FFTResult analyzeAxis(
 
 
 // ============================================================
-// Calculate vibration envelope for one 32 ms block
+// AC variance from integer sums: E[x^2] - E[x]^2
+// ============================================================
+
+double acVariance(
+    int64_t squareSum,
+    int64_t sum,
+    double count
+)
+{
+    double mean =
+        (double)sum
+        /
+        count;
+
+
+    return
+        (double)squareSum
+        /
+        count
+        -
+        mean
+        *
+        mean;
+}
+
+
+// ============================================================
+// Calculate vibration envelope for one 32 ms window
+//
+// The sums are accumulated as integers, which is cheap on this
+// FPU-less RISC-V core, and the AC RMS is then
+//
+//     sqrt( sum(x^2) / N - mean^2 )
+//
+// That is the same statistic as before, and it keeps the now
+// 125 windows per capture practically free.
+//
+// The samples are read through the envBuf* pointers, so the same
+// code serves the capture buffer and the monitor bursts.
 // ============================================================
 
 float calculateEnvelopeBlock(
     int startIndex
 )
 {
-    double meanX = 0.0;
-    double meanY = 0.0;
-    double meanZ = 0.0;
+    int64_t sumX = 0;
+    int64_t sumY = 0;
+    int64_t sumZ = 0;
+
+    int64_t squareX = 0;
+    int64_t squareY = 0;
+    int64_t squareZ = 0;
 
 
     // --------------------------------------------------------
-    // Calculate local DC
+    // Local sums (DC and energy)
     // --------------------------------------------------------
 
     for (
@@ -1155,89 +1340,97 @@ float calculateEnvelopeBlock(
         i++
     )
     {
-        meanX += axBuffer[i];
-        meanY += ayBuffer[i];
-        meanZ += azBuffer[i];
-    }
+        int32_t x =
+            envBufX[i];
 
+        int32_t y =
+            envBufY[i];
 
-    meanX /=
-        ENV_BLOCK_SIZE;
-
-
-    meanY /=
-        ENV_BLOCK_SIZE;
-
-
-    meanZ /=
-        ENV_BLOCK_SIZE;
-
-
-    // --------------------------------------------------------
-    // Calculate AC energy
-    // --------------------------------------------------------
-
-    double sumX = 0.0;
-    double sumY = 0.0;
-    double sumZ = 0.0;
-
-
-    for (
-        int i = startIndex;
-        i <
-        startIndex + ENV_BLOCK_SIZE;
-        i++
-    )
-    {
-        double x =
-            axBuffer[i]
-            -
-            meanX;
-
-
-        double y =
-            ayBuffer[i]
-            -
-            meanY;
-
-
-        double z =
-            azBuffer[i]
-            -
-            meanZ;
+        int32_t z =
+            envBufZ[i];
 
 
         sumX +=
-            x * x;
-
+            x;
 
         sumY +=
-            y * y;
-
+            y;
 
         sumZ +=
-            z * z;
+            z;
+
+
+        squareX +=
+            (int64_t)x * x;
+
+        squareY +=
+            (int64_t)y * y;
+
+        squareZ +=
+            (int64_t)z * z;
     }
 
 
+    double count =
+        (double)ENV_BLOCK_SIZE;
+
+
+    double varianceX =
+        acVariance(
+            squareX,
+            sumX,
+            count
+        );
+
+
+    double varianceY =
+        acVariance(
+            squareY,
+            sumY,
+            count
+        );
+
+
+    double varianceZ =
+        acVariance(
+            squareZ,
+            sumZ,
+            count
+        );
+
+
+    // --------------------------------------------------------
+    // AC RMS per axis (variance is clamped at 0, the integer
+    // form can round a hair negative on a flat signal)
+    // --------------------------------------------------------
+
     float rmsX =
-        sqrt(
-            sumX /
-            ENV_BLOCK_SIZE
+        (float)sqrt(
+            varianceX > 0.0
+            ?
+            varianceX
+            :
+            0.0
         );
 
 
     float rmsY =
-        sqrt(
-            sumY /
-            ENV_BLOCK_SIZE
+        (float)sqrt(
+            varianceY > 0.0
+            ?
+            varianceY
+            :
+            0.0
         );
 
 
     float rmsZ =
-        sqrt(
-            sumZ /
-            ENV_BLOCK_SIZE
+        (float)sqrt(
+            varianceZ > 0.0
+            ?
+            varianceZ
+            :
+            0.0
         );
 
 
@@ -1256,8 +1449,277 @@ float calculateEnvelopeBlock(
 
 
 // ============================================================
-// Vibration state + start/stop detection
+// Record one rising edge in the history ring
 // ============================================================
+
+void recordRisingEdge(
+    uint32_t edgeMs
+)
+{
+    edgeTimeMs[edgeWriteIndex] =
+        edgeMs;
+
+
+    edgeWriteIndex =
+        (edgeWriteIndex + 1)
+        %
+        STARTSTOP_EDGE_HISTORY;
+
+
+    if (
+        edgeStoredCount <
+        STARTSTOP_EDGE_HISTORY
+    )
+    {
+        edgeStoredCount++;
+    }
+
+
+    lastRisingEdgeMs =
+        edgeMs;
+}
+
+
+// ============================================================
+// Start/stop rate from the rising-edge history
+//
+// 1) Fast cycling: average over the edges inside the
+//    observation window. One missed edge only biases the value
+//    instead of doubling or halving it.
+// 2) Slow cycling: single period between the last two edges.
+// 3) No edge for STARTSTOP_HOLD_MS: report 0. Below that the
+//    previous value is kept, so a single missed edge does not
+//    blank the field.
+// ============================================================
+
+void updateStartStopFrequency(
+    uint32_t nowMs
+)
+{
+    int count = 0;
+
+    uint32_t firstMs = 0;
+    uint32_t lastMs = 0;
+
+
+    for (
+        int i = 0;
+        i < edgeStoredCount;
+        i++
+    )
+    {
+        int slot =
+            (
+                edgeWriteIndex
+                -
+                edgeStoredCount
+                +
+                i
+                +
+                STARTSTOP_EDGE_HISTORY
+            )
+            %
+            STARTSTOP_EDGE_HISTORY;
+
+
+        uint32_t edgeMs =
+            edgeTimeMs[slot];
+
+
+        if (
+            (uint32_t)(
+                nowMs
+                -
+                edgeMs
+            )
+            >
+            STARTSTOP_AVG_WINDOW_MS
+        )
+        {
+            continue;
+        }
+
+
+        if (count == 0)
+        {
+            firstMs =
+                edgeMs;
+        }
+
+
+        lastMs =
+            edgeMs;
+
+
+        count++;
+    }
+
+
+    // --------------------------------------------------------
+    // 1) average rate over the observation window
+    // --------------------------------------------------------
+
+    if (
+        count >=
+        STARTSTOP_MIN_EDGES
+        &&
+        lastMs > firstMs
+    )
+    {
+        float rate =
+            (float)(
+                count
+                -
+                1
+            )
+            *
+            1000.0f
+            /
+            (float)(
+                lastMs
+                -
+                firstMs
+            );
+
+
+        if (
+            rate >
+            STARTSTOP_MAX_HZ
+        )
+        {
+            rate =
+                STARTSTOP_MAX_HZ;
+        }
+
+
+        startStopFrequency =
+            rate;
+
+
+        return;
+    }
+
+
+    // --------------------------------------------------------
+    // 2) slow start/stop: period between the last two edges
+    // --------------------------------------------------------
+
+    if (
+        edgeStoredCount >= 2
+        &&
+        lastRisingEdgeMs != 0
+        &&
+        (uint32_t)(
+            nowMs
+            -
+            lastRisingEdgeMs
+        )
+        <=
+        STARTSTOP_HOLD_MS
+    )
+    {
+        int previousSlot =
+            (
+                edgeWriteIndex
+                -
+                2
+                +
+                STARTSTOP_EDGE_HISTORY
+            )
+            %
+            STARTSTOP_EDGE_HISTORY;
+
+
+        uint32_t periodMs =
+            lastRisingEdgeMs
+            -
+            edgeTimeMs[previousSlot];
+
+
+        if (
+            periodMs > 0
+            &&
+            periodMs <=
+            STARTSTOP_SLOW_SPAN_MS
+        )
+        {
+            float rate =
+                1000.0f
+                /
+                (float)periodMs;
+
+
+            if (
+                rate >
+                STARTSTOP_MAX_HZ
+            )
+            {
+                rate =
+                    STARTSTOP_MAX_HZ;
+            }
+
+
+            startStopFrequency =
+                rate;
+
+
+            return;
+        }
+    }
+
+
+    // --------------------------------------------------------
+    // 3) nothing periodic any more
+    // --------------------------------------------------------
+
+    if (
+        lastRisingEdgeMs == 0
+        ||
+        (uint32_t)(
+            nowMs
+            -
+            lastRisingEdgeMs
+        )
+        >
+        STARTSTOP_HOLD_MS
+    )
+    {
+        startStopFrequency =
+            0.0f;
+    }
+}
+
+
+// ============================================================
+// Vibration presence + rising-edge detection
+//
+// Every sampled window is fed through here, whether it comes from
+// the capture or from a monitor burst, so a start/stop pause can
+// no longer hide in the time the FFTs need. Whether the
+// measurement counts as vibrating is evaluated afterwards from
+// measurementBlocks.
+// ============================================================
+
+void setEnvelopeSource(
+    int16_t *x,
+    int16_t *y,
+    int16_t *z,
+    int windowCount
+)
+{
+    envBufX =
+        x;
+
+    envBufY =
+        y;
+
+    envBufZ =
+        z;
+
+    envWindowCount =
+        windowCount;
+}
+
 
 void processEnvelope(
     uint32_t captureStartUs,
@@ -1266,14 +1728,30 @@ void processEnvelope(
 {
     for (
         int block = 0;
-        block < ENV_BLOCK_COUNT;
+        block < envWindowCount;
         block++
     )
     {
         int index =
             block
             *
-            ENV_BLOCK_SIZE;
+            ENV_BLOCK_HOP;
+
+
+        uint32_t blockMs =
+            (
+                captureStartUs
+                /
+                1000UL
+            )
+            +
+            (uint32_t)(
+                (float)index
+                /
+                fs
+                *
+                1000.0f
+            );
 
 
         float envelope =
@@ -1282,40 +1760,153 @@ void processEnvelope(
             );
 
 
+        // ----------------------------------------------------
+        // Running peak and hysteresis levels
+        // ----------------------------------------------------
+
+        envelopePeak *=
+            ENV_PEAK_DECAY;
+
+
+        if (
+            envelope >
+            envelopePeak
+        )
+        {
+            envelopePeak =
+                envelope;
+        }
+
+
+        float onLevel =
+            VIB_ON_RATIO
+            *
+            envelopePeak;
+
+
+        if (
+            onLevel <
+            VIB_ON_THRESHOLD
+        )
+        {
+            onLevel =
+                VIB_ON_THRESHOLD;
+        }
+
+
+        float offLevel =
+            VIB_OFF_RATIO
+            *
+            envelopePeak;
+
+
+        if (
+            offLevel <
+            VIB_OFF_FLOOR
+        )
+        {
+            offLevel =
+                VIB_OFF_FLOOR;
+        }
+
+
+        if (
+            envelope >=
+            VIB_ON_THRESHOLD
+        )
+        {
+            measurementBlocks++;
+        }
+
+
         bool oldState =
             vibrationState;
 
 
         // ----------------------------------------------------
-        // Hysteresis
+        // Hysteresis with level confirmation
+        //
+        // A crossing only takes effect after VIB_CONFIRM_BLOCKS
+        // consecutive blocks beyond the level. Chatter around a
+        // threshold therefore cannot fabricate rising edges.
         // ----------------------------------------------------
 
         if (!vibrationState)
         {
             if (
                 envelope >=
-                VIB_ON_THRESHOLD
+                onLevel
             )
             {
-                vibrationState =
-                    true;
+                if (armRunBlocks == 0)
+                {
+                    armRunStartMs =
+                        blockMs;
+                }
+
+
+                armRunBlocks++;
+
+
+                if (
+                    armRunBlocks >=
+                    VIB_CONFIRM_BLOCKS
+                )
+                {
+                    vibrationState =
+                        true;
+
+
+                    // Start the next run from scratch, otherwise
+                    // the following edge would reuse the timestamp
+                    // of this run's first block.
+                    armRunBlocks =
+                        0;
+                }
+            }
+            else
+            {
+                armRunBlocks =
+                    0;
             }
         }
         else
         {
             if (
                 envelope <=
-                VIB_OFF_THRESHOLD
+                offLevel
             )
             {
-                vibrationState =
-                    false;
+                offRunBlocks++;
+
+
+                if (
+                    offRunBlocks >=
+                    VIB_CONFIRM_BLOCKS
+                )
+                {
+                    vibrationState =
+                        false;
+
+
+                    offRunBlocks =
+                        0;
+                }
+            }
+            else
+            {
+                offRunBlocks =
+                    0;
             }
         }
 
 
         // ----------------------------------------------------
         // OFF -> ON rising edge
+        //
+        // The timestamp is the first block of the confirmed run,
+        // so the confirmation delay does not bias the measured
+        // period.
         // ----------------------------------------------------
 
         if (
@@ -1324,88 +1915,121 @@ void processEnvelope(
             vibrationState
         )
         {
-            float offsetSeconds =
-                (float)index
-                /
-                fs;
-
-
-            uint32_t edgeMs =
-                (
-                    captureStartUs
-                    /
-                    1000UL
-                )
-                +
-                (uint32_t)(
-                    offsetSeconds
-                    *
-                    1000.0f
-                );
-
-
-            previousRisingEdgeMs =
-                lastRisingEdgeMs;
-
-
-            lastRisingEdgeMs =
-                edgeMs;
-
-
-            if (
-                previousRisingEdgeMs
-                != 0
-            )
-            {
-                uint32_t periodMs =
-                    lastRisingEdgeMs
-                    -
-                    previousRisingEdgeMs;
-
-
-                if (periodMs > 0)
-                {
-                    float frequency =
-                        1000.0f
-                        /
-                        periodMs;
-
-
-                    if (
-                        frequency <=
-                        STARTSTOP_MAX_HZ
-                    )
-                    {
-                        startStopFrequency =
-                            frequency;
-                    }
-                }
-            }
+            recordRisingEdge(
+                armRunStartMs
+            );
         }
     }
 
 
     // --------------------------------------------------------
-    // No new rising edge for 3 seconds:
-    // treat as no start/stop periodicity.
+    // Refresh the start/stop rate of this capture from the
+    // rising-edge history.
     // --------------------------------------------------------
 
-    if (
-        lastRisingEdgeMs != 0
+    updateStartStopFrequency(
+        millis()
+    );
+}
+
+
+// ============================================================
+// Monitor burst
+//
+// Samples MON_BURST_SAMPLES at the normal 1 ms cadence and feeds
+// them to the envelope detector. Called between the FFTs, so the
+// detector keeps watching the machine during the analysis
+// instead of losing every pause that happens to fall into that
+// window.
+// ============================================================
+
+void captureMonitorBurst()
+{
+    uint32_t nextSampleTime =
+        micros();
+
+
+    uint32_t startUs =
+        0;
+
+
+    for (
+        int i = 0;
+        i < MON_BURST_SAMPLES;
+        i++
     )
     {
-        if (
-            millis()
-            -
-            lastRisingEdgeMs
-            >
-            STARTSTOP_TIMEOUT_MS
+        while (
+            (int32_t)(
+                micros()
+                -
+                nextSampleTime
+            ) < 0
         )
         {
-            startStopFrequency =
-                0.0f;
+            yield();
         }
+
+
+        uint32_t sampleTime =
+            micros();
+
+
+        if (i == 0)
+        {
+            startUs =
+                sampleTime;
+        }
+
+
+        if (
+            !readAcceleration(
+                monBufferX[i],
+                monBufferY[i],
+                monBufferZ[i]
+            )
+        )
+        {
+            // Same policy as the main capture: reuse the previous
+            // sample instead of injecting a zero.
+
+            if (i > 0)
+            {
+                monBufferX[i] =
+                    monBufferX[i - 1];
+
+                monBufferY[i] =
+                    monBufferY[i - 1];
+
+                monBufferZ[i] =
+                    monBufferZ[i - 1];
+            }
+            else
+            {
+                monBufferX[i] = 0;
+                monBufferY[i] = 0;
+                monBufferZ[i] = 0;
+            }
+        }
+
+
+        nextSampleTime +=
+            SAMPLE_PERIOD_US;
     }
+
+
+    setEnvelopeSource(
+        monBufferX,
+        monBufferY,
+        monBufferZ,
+        MON_BURST_WINDOWS
+    );
+
+
+    processEnvelope(
+        startUs,
+        1000.0f
+    );
 }
 
 
@@ -1493,7 +2117,25 @@ void runMeasurement()
 
     // ========================================================
     //Analyze short-time vibration envelope
+    //
+    // The capture is scanned first, then a monitor burst after
+    // each FFT, so no pause is lost while the spectrum is being
+    // computed. "Vibration present" is decided at the end from
+    // the accumulated blocks instead of the last block only, so a
+    // capture ending in the quiet phase no longer reports 0 while
+    // the spectrum is perfectly valid.
     // ========================================================
+
+    measurementBlocks = 0;
+
+
+    setEnvelopeSource(
+        axBuffer,
+        ayBuffer,
+        azBuffer,
+        ENV_BLOCK_COUNT
+    );
+
 
     processEnvelope(
         firstSampleUs,
@@ -1516,6 +2158,9 @@ void runMeasurement()
     yield();
 
 
+    captureMonitorBurst();
+
+
     // ========================================================
     //FFT Y axis
     // ========================================================
@@ -1531,6 +2176,9 @@ void runMeasurement()
     yield();
 
 
+    captureMonitorBurst();
+
+
     // ========================================================
     //FFT Z axis
     // ========================================================
@@ -1544,6 +2192,17 @@ void runMeasurement()
 
 
     yield();
+
+
+    captureMonitorBurst();
+
+
+    vibrationPresent =
+        (
+            measurementBlocks
+            >=
+            VIB_MIN_ON_BLOCKS
+        );
 
 
     // ========================================================
@@ -1594,7 +2253,7 @@ void runMeasurement()
     // 正常频率：80~180 Hz
     bool frequencyInRange =
         (
-            vibrationState
+            vibrationPresent
             &&
             spectrumValid
             &&
@@ -1611,7 +2270,7 @@ void runMeasurement()
     // 超过180 Hz时黄灯亮；180 Hz本身仍属于正常范围
     bool overFrequency =
         (
-            vibrationState
+            vibrationPresent
             &&
             spectrumValid
             &&
@@ -1638,7 +2297,8 @@ void runMeasurement()
     // ========================================================
     // Yellow LED
     //
-    // ON  = reliable vibration frequency > 180 Hz
+    // ON  = vibration present in this capture and a reliable
+    //       vibration frequency > 180 Hz
     // OFF = frequency <= 180 Hz or no valid vibration
     // ========================================================
 
@@ -1667,7 +2327,7 @@ void runMeasurement()
         outputLine,
         sizeof(outputLine),
         "VIB=%d,FREQ=%.2fHz,STARTSTOP=%.3fHz,RATIO=%.2f",
-        vibrationState
+        vibrationPresent
         ?
         1
         :
